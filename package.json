@@ -1,15 +1,15 @@
 {
 "name": "sales-trainer-api",
 "version": "1.0.0",
-"description": "Sales trainer AI backend",
+"description": "Backend API for the door-to-door sales trainer",
 "main": "index.js",
 "type": "module",
 "scripts": {
-"start": "node api/train.js"
+"start": "node index.js"
 },
 "dependencies": {
 "cors": "^2.8.5",
 "express": "^4.19.2",
-"openai": "^4.67.3"
+"openai": "^4.73.0"
 }
 }
