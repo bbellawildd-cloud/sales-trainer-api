@@ -1,7 +1,10 @@
+// index.js — Sales Trainer API (multi-industry + personas + XP)
+
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 
+// ---------- EXPRESS APP ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -12,101 +15,149 @@ apiKey: process.env.OPENAI_API_KEY,
 });
 
 // ---------- INDUSTRY CONFIG ----------
-// Keys you'll send from the front-end: "pest_d2d", "solar_d2d", "life_phone", "health_phone"
 const INDUSTRY_CONFIG = {
-pest_d2d: {
-label: "door-to-door pest control homeowner",
-primer: `
-You are a realistic homeowner answering the door to a pest control sales rep.
-You live in a typical suburban neighborhood.
-You care about cost, bugs inside the house, and whether this company is legit.
-Use natural, conversational language with some emotion and personality.
-`.trim(),
+pest: {
+label: "Door-to-door pest control",
+channel: "door",
+typicalCustomer: "Suburban homeowner who gets pests in/around the house.",
+goals:
+"Decide if they trust the rep enough to let them treat the home. Price sensitivity, but also cares about safety, spouse approval, and convenience.",
 },
-solar_d2d: {
-label: "door-to-door solar homeowner",
-primer: `
-You are a homeowner answering the door to a solar sales rep.
-You care about your monthly bill, roof condition, HOA, incentives, and trust.
-You may have heard about solar scams and are somewhat skeptical.
-Speak like a real person at the door, not like an AI.
-`.trim(),
+solar: {
+label: "Door-to-door solar",
+channel: "door",
+typicalCustomer:
+"Homeowner who has heard of solar but is skeptical about cost, contracts, or roof impact.",
+goals:
+"Figure out if switching to solar makes financial sense and whether they trust the rep.",
 },
-life_phone: {
-label: "life insurance phone prospect",
-primer: `
-You are on the phone with a life insurance sales agent.
-You care about monthly costs, your family being protected, and whether this is a scam.
-You may have some fear around health questions and commitment.
-Talk like a real person on the phone, using short, natural phrases.
-`.trim(),
+life: {
+label: "Life insurance (phone)",
+channel: "phone",
+typicalCustomer:
+"Working adult with family responsibilities, busy schedule, and some skepticism about insurance pitches.",
+goals:
+"Understand if the coverage is worth the cost; avoid being pressured; protect family income.",
 },
-health_phone: {
-label: "health insurance phone prospect",
-primer: `
-You are on the phone with a health insurance agent.
-You care about premiums, deductibles, your current doctor, and network.
-You might be frustrated with your current coverage.
-Keep responses realistic, human, and sometimes emotional.
-`.trim(),
+health: {
+label: "Health insurance (phone)",
+channel: "phone",
+typicalCustomer:
+"Individual or family looking for coverage, but confused about deductibles, networks, and subsidies.",
+goals:
+"Avoid surprise bills, make sure doctors are in network, and not overpay for coverage.",
+},
+saas: {
+label: "Warehouse SaaS / Rufus-style",
+channel: "phone",
+typicalCustomer:
+"Ops / warehouse manager evaluating new tech while juggling fires all day.",
+goals:
+"Save time and money, but avoid risky rollouts and vaporware. Needs clear ROI.",
 },
 };
 
-// ---------- PERSONAS & DIFFICULTY ----------
+// default industry if none provided
+let ACTIVE_INDUSTRY = "pest";
 
-const PERSONAS = [
-"Busy and impatient, wants you to get to the point fast",
-"Friendly and curious, open to hearing the pitch",
-"Skeptical and analytical, asks a lot of detailed questions",
-"Price-sensitive and hesitant, worried about cost",
-"Distracted and half-paying attention, multitasking while you talk",
-"Confident and talks over you, tries to control the conversation",
-"Hard reject attitude, immediately looking for reasons to say no",
-"Eager and positive, already somewhat interested",
-"Confused and needs simple explanations, not very technical",
-"Sarcastic and challenging, likes to test salespeople"
-];
+// ---------- SYSTEM PROMPT BUILDER ----------
+function buildSystemPrompt(industryKey) {
+const cfg =
+INDUSTRY_CONFIG[industryKey] || INDUSTRY_CONFIG[ACTIVE_INDUSTRY];
 
-const DIFFICULTIES = [
-"Beginner-friendly: gives you chances and is fairly patient",
-"Intermediate: pushes back with a few realistic objections",
-"Hard: lots of objections, time pressure, and skepticism",
-"Expert mode: constant objections and pressure, expects a top closer"
-];
+const channelText =
+cfg.channel === "door"
+? "You are speaking to a door-to-door sales rep at the front door."
+: "You are speaking to a sales rep over the phone.";
 
-function pickRandom(arr) {
-return arr[Math.floor(Math.random() * arr.length)];
+return `
+You are a realistic ${cfg.label} customer for a sales training simulator.
+
+${channelText}
+You have natural human emotions, a backstory, and a personality. Sometimes you're annoyed or busy, sometimes curious, sometimes very interested.
+
+You are training the rep. Your job:
+- Respond like a real customer in short, natural sentences.
+- Ask questions, raise objections, and react to the rep's tone and wording.
+- Avoid giving in too easily. Make them EARN the close.
+- Sometimes be skeptical, distracted, or price-sensitive.
+- Sometimes be open, friendly, or excited.
+- Use normal everyday language, not corporate-speak.
+
+CONVERSATION RULES:
+- Keep each reply 1–3 sentences max, like a real back-and-forth.
+- Stay in character (you are the customer, not a coach).
+- Do NOT explain that this is training.
+- Do NOT talk about "AI" or "simulation" in the reply.
+
+ENDING THE CONVERSATION:
+Eventually, decide if the rep wins or loses:
+- If they do poorly, end with a clear "no" (politely or firmly).
+- If they do well, you can end with a clear "yes" or "let's move forward".
+- When you feel the pitch has logically run its course, mark "done": true in your JSON.
+
+SCORING & FEEDBACK:
+For every reply you send back, you must also output:
+- A short 1–2 sentence feedback summary for the rep.
+- A numeric score from 0–100 for how well they did so far.
+- An XP delta (how many XP points they should gain this turn).
+- Your persona details (name, age, mood, short description).
+
+OUTPUT FORMAT (VERY IMPORTANT):
+Always respond as a single JSON object with this exact shape:
+
+{
+"reply": "what you say out loud to the rep",
+"done": false,
+"score": 78,
+"xpDelta": 12,
+"feedback": "Short coaching feedback for the rep.",
+"persona": {
+"name": "Customer name",
+"age": 34,
+"mood": "annoyed but listening",
+"description": "1–2 sentences about who this customer is."
+}
 }
 
-// ---------- HEALTH CHECK ----------
+- "reply" is what the rep hears from you.
+- "done" is true ONLY when the pitch is clearly over (win or lose).
+- "score" is your current rating of the rep's performance (0–100).
+- "xpDelta" is how much XP they earn from THIS turn.
+- "feedback" is direct advice as if you're a coach AFTER the call.
+- "persona" stays consistent during the conversation.
+
+DO NOT return anything that is not valid JSON.
+`;
+}
+
+// ---------- ROUTES ----------
+
+// Health check
 app.get("/", (req, res) => {
 res.json({
 ok: true,
-message: "Sales trainer API is live",
+activeIndustry: ACTIVE_INDUSTRY,
 industries: Object.keys(INDUSTRY_CONFIG),
 });
 });
 
-// ---------- MAIN CHAT ENDPOINT ----------
+// Simple admin endpoint to switch active industry (optional)
+app.post("/api/admin/industry", (req, res) => {
+const { industry } = req.body || {};
+if (!industry || !INDUSTRY_CONFIG[industry]) {
+return res
+.status(400)
+.json({ error: "Invalid industry", allowed: Object.keys(INDUSTRY_CONFIG) });
+}
+ACTIVE_INDUSTRY = industry;
+res.json({ ok: true, activeIndustry: ACTIVE_INDUSTRY });
+});
 
-/**
-* Body shape expected:
-* {
-* message: "rep's latest line",
-* history: [ { role: "user" | "assistant", content: "..." }, ... ] // optional
-* industry: "pest_d2d" | "solar_d2d" | "life_phone" | "health_phone" // optional, defaults to pest_d2d
-* persona: "string describing persona" // optional
-* difficulty: "string describing difficulty" // optional
-* }
-*/
+// Main chat endpoint
 app.post("/api/chat", async (req, res) => {
-const {
-message,
-history = [],
-industry = "pest_d2d",
-persona,
-difficulty,
-} = req.body || {};
+try {
+const { message, history = [], industry } = req.body || {};
 
 if (!message || typeof message !== "string") {
 return res
@@ -114,99 +165,66 @@ return res
 .json({ error: "Missing 'message' in body (string required)" });
 }
 
-const config = INDUSTRY_CONFIG[industry] || INDUSTRY_CONFIG["pest_d2d"];
+const activeIndustry = industry || ACTIVE_INDUSTRY;
+const systemPrompt = buildSystemPrompt(activeIndustry);
 
-const finalPersona = persona || pickRandom(PERSONAS);
-const finalDifficulty = difficulty || pickRandom(DIFFICULTIES);
+// build chat history (optional)
+const historyMessages = Array.isArray(history)
+? history.map((h) => ({
+role: h.role === "assistant" ? "assistant" : "user",
+content: String(h.content || ""),
+}))
+: [];
 
-// System prompt that controls the AI "customer"
-const systemPrompt = `
-You are role-playing as a ${config.label} in a sales training simulation.
+const messages = [
+{ role: "system", content: systemPrompt },
+...historyMessages,
+{ role: "user", content: message },
+];
 
-Persona:
-${finalPersona}
-
-Difficulty:
-${finalDifficulty}
-
-Industry context:
-${config.primer}
-
-Rules:
-- Stay 100% in character as the customer/prospect. Never say you are an AI or language model.
-- Speak in short, natural sentences like a real person at the door or on the phone.
-- Use realistic objections, questions, and reactions for this industry.
-- Let the sales rep do most of the persuading. You respond, react, and push back.
-- Do NOT give coaching, feedback, or meta commentary. Only act as the customer.
-
-Conversation ending:
-- Continue the back-and-forth until it would realistically end in real life.
-- You may end the conversation in one of these ways:
-1) Not interested / wants the rep to go away.
-2) Qualified lead / wants more info or to book an appointment.
-3) Sale / clearly agrees to move forward.
-
-When you decide the conversation is over, add EXACTLY ONE tag at the END of your message on a new line:
-
-<END_OF_CALL reason="not_interested">
-or
-<END_OF_CALL reason="qualified_lead">
-or
-<END_OF_CALL reason="sale">
-
-Do NOT explain the tag. Do NOT add any other XML or JSON. Just the customer dialogue, then the tag.
-`.trim();
-
-try {
 const completion = await openai.chat.completions.create({
 model: "gpt-4o-mini",
-messages: [
-{ role: "system", content: systemPrompt },
-...history.map((h) => ({
-role: h.role === "assistant" ? "assistant" : "user",
-content: h.content || "",
-})),
-{ role: "user", content: message },
-],
-temperature: 0.85,
-max_tokens: 500,
+response_format: { type: "json_object" },
+messages,
 });
 
-const rawReply =
-completion.choices?.[0]?.message?.content || "Sorry, I have no reply.";
+const content = completion.choices[0]?.message?.content || "{}";
 
-// Look for the <END_OF_CALL ...> tag
-const endMatch = rawReply.match(
-/<END_OF_CALL reason="([^"]+)"\s*>/i
-);
+let data;
+try {
+data = JSON.parse(content);
+} catch (err) {
+console.error("JSON parse error from OpenAI:", content);
+return res.status(500).json({
+error: "Failed to parse AI response JSON",
+raw: content,
+});
+}
 
-const cleanReply = rawReply.replace(/<END_OF_CALL[^>]*>/i, "").trim();
-
-const done = !!endMatch;
-const outcome = endMatch ? endMatch[1] : null;
-
-// Simple XP logic stub you can tweak later
-let xpEarned = 0;
-if (done) {
-if (outcome === "sale") xpEarned = 30;
-else if (outcome === "qualified_lead") xpEarned = 20;
-else xpEarned = 10; // not_interested but finished the scenario
+// basic safety defaults
+if (typeof data.reply !== "string") {
+data.reply = "Sorry, something went wrong generating a reply.";
+}
+if (typeof data.done !== "boolean") data.done = false;
+if (typeof data.score !== "number") data.score = 0;
+if (typeof data.xpDelta !== "number") data.xpDelta = 0;
+if (typeof data.feedback !== "string") data.feedback = "";
+if (typeof data.persona !== "object" || !data.persona) {
+data.persona = {
+name: "Unknown",
+age: null,
+mood: "neutral",
+description: "",
+};
 }
 
 return res.json({
-reply: cleanReply,
-done,
-outcome, // "not_interested" | "qualified_lead" | "sale" | null
-persona: finalPersona,
-difficulty: finalDifficulty,
-xpEarned,
+...data,
+industry: activeIndustry,
 });
 } catch (err) {
 console.error("Error in /api/chat:", err);
-return res.status(500).json({
-error: "Server error calling OpenAI",
-details: err?.message || String(err),
-});
+return res.status(500).json({ error: "Server error" });
 }
 });
 
