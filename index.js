@@ -1,38 +1,38 @@
-// -------------------------------------------------------
-// SALES TRAINER API (FULL VERSION)
-// -------------------------------------------------------
-
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 
-// -------------------- EXPRESS APP ----------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -------------------- OPENAI CLIENT --------------------
 const openai = new OpenAI({
 apiKey: process.env.OPENAI_API_KEY
 });
 
-// -------------------- INDUSTRY SYSTEM ------------------
+/* -------------------------------
+IN-MEMORY SESSION STORAGE
+-------------------------------- */
+const sessions = {};
+
+/* -------------------------------
+INDUSTRY CONFIGS
+-------------------------------- */
 const INDUSTRY_CONFIG = {
 pest: `
-You are a homeowner being approached by a door-to-door pest control rep.
-You should react like a real human, not a chatbot.
-Be skeptical, curious, annoyed, or friendly depending on mood.
-Keep responses short and realistic.
+You are a homeowner approached by a door-to-door pest control sales rep.
+Act like a realistic human: cautious, curious, sometimes annoyed.
+Keep responses short and natural.
 End the interaction with either:
 - "I'm not interested." OR
 - "Okay, let's do it." if the rep does extremely well.
 `,
 
 solar: `
-You are a homeowner approached by a solar rep.
+You are a homeowner approached by a solar sales rep.
 Act like a realistic human: cautious, curious, skeptical.
 Keep responses short and natural.
-End with "No thanks" OR "Okay let’s do it."
+End with "No thanks" OR "Okay let's do it."
 `,
 
 life_insurance: `
@@ -48,28 +48,36 @@ End with either declining or signing up.
 `
 };
 
-// Change this to switch industries
+// change industry here
 const ACTIVE_INDUSTRY = INDUSTRY_CONFIG.pest;
 
-// -------------------- HEALTH CHECK ---------------------
+/* -------------------------------
+HEALTH CHECK
+-------------------------------- */
 app.get("/", (req, res) => {
-res.json({ ok: true, industry: ACTIVE_INDUSTRY });
+res.json({ ok: true });
 });
 
-// -------------------------------------------------------
-// MAIN CHAT ENDPOINT (Full Conversation Mode)
-// -------------------------------------------------------
+/* -------------------------------
+MAIN CHAT ENDPOINT
+-------------------------------- */
 app.post("/api/chat", async (req, res) => {
-const { message, history = [] } = req.body;
+const { message, sessionId } = req.body;
 
-if (!message || typeof message !== "string") {
-return res.status(400).json({
-error: "Missing `message` in body (string required)"
-});
+if (!sessionId) {
+return res.status(400).json({ error: "Missing sessionId" });
 }
 
-try {
-// Random persona every time
+if (!message || typeof message !== "string") {
+return res.status(400).json({ error: "Missing message" });
+}
+
+if (!sessions[sessionId]) {
+sessions[sessionId] = [];
+}
+
+const history = sessions[sessionId];
+
 const personas = [
 "grumpy older man who hates salespeople",
 "sweet elderly woman who is polite but confused",
@@ -80,13 +88,12 @@ const personas = [
 "very skeptical engineer",
 "laid-back surfer personality",
 "short-tempered New Yorker",
-"quiet introvert who doesn’t like talking"
+"quiet introvert who doesn't like talking"
 ];
 
 const persona =
 personas[Math.floor(Math.random() * personas.length)];
 
-// 🔥 System Prompt (Controls the AI personality)
 const SYSTEM_PROMPT = `
 You are acting as a REAL HUMAN for a sales training simulator.
 
@@ -108,42 +115,91 @@ Rules:
 - Stay in character the entire time.
 `;
 
-// 🔥 Create AI Conversation
+try {
+history.push({ role: "user", content: message });
+
 const completion = await openai.chat.completions.create({
 model: "gpt-4o-mini",
 messages: [
 { role: "system", content: SYSTEM_PROMPT },
-...history.map((h) => ({
-role: h.role,
-content: h.content
-})),
-{ role: "user", content: message }
+...history
 ]
 });
 
-const reply =
-completion.choices?.[0]?.message?.content || "…";
+const reply = completion.choices[0].message.content;
 
-return res.json({
+history.push({ role: "assistant", content: reply });
+
+res.json({
 reply,
-persona,
-updatedHistory: [
-...history,
-{ role: "user", content: message },
-{ role: "assistant", content: reply }
-]
+persona
 });
 } catch (err) {
 console.error("API ERROR:", err);
-return res.status(500).json({
+res.status(500).json({
 error: "Server error",
 details: err.message
 });
 }
 });
 
-// -------------------- SERVER LISTENER ------------------
+/* -------------------------------
+EVALUATION / SCORING ENDPOINT
+-------------------------------- */
+app.post("/api/evaluate", async (req, res) => {
+const { sessionId } = req.body;
+
+if (!sessionId || !sessions[sessionId]) {
+return res.status(404).json({ error: "Session not found" });
+}
+
+const history = sessions[sessionId];
+
+const evaluationPrompt = `
+You are a professional sales coach.
+
+Evaluate the sales rep on a scale of 1–5 for each category:
+
+1. Opener & Rapport
+2. Discovery Questions
+3. Objection Handling
+4. Confidence & Tone
+5. Closing Attempt
+
+For EACH category:
+- Give a numeric score
+- Quote ONE example from the conversation
+- Give ONE specific improvement tip
+
+Finish with a short overall summary.
+Be concise and direct.
+`;
+
+try {
+const completion = await openai.chat.completions.create({
+model: "gpt-4o-mini",
+messages: [
+{ role: "system", content: evaluationPrompt },
+{ role: "user", content: JSON.stringify(history) }
+]
+});
+
+res.json({
+evaluation: completion.choices[0].message.content
+});
+} catch (err) {
+console.error("EVAL ERROR:", err);
+res.status(500).json({
+error: "Evaluation failed",
+details: err.message
+});
+}
+});
+
+/* -------------------------------
+SERVER LISTENER
+-------------------------------- */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-console.log(`Sales Trainer API running on port ${PORT}`)
-);
+app.listen(PORT, () => {
+console.log(`Sales Trainer API running on port ${PORT}`);
+});
