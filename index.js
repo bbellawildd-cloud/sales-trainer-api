@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import crypto from "crypto";
 
 const app = express();
 app.use(cors());
@@ -10,196 +11,186 @@ const openai = new OpenAI({
 apiKey: process.env.OPENAI_API_KEY
 });
 
-/* -------------------------------
-IN-MEMORY SESSION STORAGE
--------------------------------- */
+/* -------------------------
+IN-MEMORY DATA STORES
+-------------------------- */
 const sessions = {};
+const reps = {}; // repId → rep data
+const companies = {}; // companyId → repIds
 
-/* -------------------------------
-INDUSTRY CONFIGS
--------------------------------- */
-const INDUSTRY_CONFIG = {
-pest: `
-You are a homeowner approached by a door-to-door pest control sales rep.
-Act like a realistic human: cautious, curious, sometimes annoyed.
-Keep responses short and natural.
-End the interaction with either:
-- "I'm not interested." OR
-- "Okay, let's do it." if the rep does extremely well.
-`,
+/* -------------------------
+XP + LEVEL CONFIG
+-------------------------- */
+const LEVELS = [
+{ level: 1, xp: 0 },
+{ level: 2, xp: 50 },
+{ level: 3, xp: 125 },
+{ level: 4, xp: 250 },
+{ level: 5, xp: 450 },
+{ level: 6, xp: 700 },
+{ level: 7, xp: 1000 }
+];
 
-solar: `
-You are a homeowner approached by a solar sales rep.
-Act like a realistic human: cautious, curious, skeptical.
-Keep responses short and natural.
-End with "No thanks" OR "Okay let's do it."
-`,
-
-life_insurance: `
-You are on a phone call with a life insurance rep.
-Respond as a busy but polite adult.
-Be realistic. End with yes/no at the end depending on the rep.
-`,
-
-health_insurance: `
-You are talking to a health insurance agent on the phone.
-Act like a real person who is evaluating options.
-End with either declining or signing up.
-`
+const DIFFICULTY_MULTIPLIER = {
+1: 1.0,
+2: 1.1,
+3: 1.25,
+4: 1.4,
+5: 1.6
 };
 
-// change industry here
-const ACTIVE_INDUSTRY = INDUSTRY_CONFIG.pest;
+/* -------------------------
+INDUSTRY PROMPT
+-------------------------- */
+const INDUSTRY_PROMPT = `
+You are a real homeowner talking to a door-to-door sales rep.
+Be realistic, human, short responses.
+You may be skeptical, annoyed, friendly, or distracted.
+End with either "I'm not interested." or "Okay let's do it."
+`;
 
-/* -------------------------------
-HEALTH CHECK
--------------------------------- */
-app.get("/", (req, res) => {
-res.json({ ok: true });
-});
-
-/* -------------------------------
-MAIN CHAT ENDPOINT
--------------------------------- */
-app.post("/api/chat", async (req, res) => {
-const { message, sessionId } = req.body;
-
-if (!sessionId) {
-return res.status(400).json({ error: "Missing sessionId" });
+/* -------------------------
+UTIL
+-------------------------- */
+function getLevel(totalXp) {
+let current = 1;
+for (const l of LEVELS) {
+if (totalXp >= l.xp) current = l.level;
+}
+return current;
 }
 
-if (!message || typeof message !== "string") {
-return res.status(400).json({ error: "Missing message" });
+/* -------------------------
+CHAT
+-------------------------- */
+app.post("/api/chat", async (req, res) => {
+const { message, sessionId, repId, companyId, difficulty = 2 } = req.body;
+
+if (!message || !sessionId || !repId || !companyId) {
+return res.status(400).json({ error: "Missing fields" });
 }
 
 if (!sessions[sessionId]) {
-sessions[sessionId] = [];
+sessions[sessionId] = {
+history: [],
+repId,
+companyId,
+difficulty
+};
 }
 
-const history = sessions[sessionId];
+if (!reps[repId]) {
+reps[repId] = {
+repId,
+companyId,
+totalXp: 0,
+level: 1,
+sessions: 0
+};
+if (!companies[companyId]) companies[companyId] = [];
+companies[companyId].push(repId);
+}
 
-const personas = [
-"grumpy older man who hates salespeople",
-"sweet elderly woman who is polite but confused",
-"busy dad who is annoyed but still listening",
-"excited new homeowner open to savings",
-"tired mother who is stressed",
-"friendly chatty neighbor",
-"very skeptical engineer",
-"laid-back surfer personality",
-"short-tempered New Yorker",
-"quiet introvert who doesn't like talking"
-];
-
-const persona =
-personas[Math.floor(Math.random() * personas.length)];
-
-const SYSTEM_PROMPT = `
-You are acting as a REAL HUMAN for a sales training simulator.
-
-Industry Situation:
-${ACTIVE_INDUSTRY}
-
-Persona:
-${persona}
-
-Rules:
-- Respond like a REAL PERSON.
-- Do NOT sound like AI.
-- Keep responses SHORT (1–2 sentences max).
-- Have natural pauses, fillers, emotions.
-- You can be confused, irritated, friendly, etc.
-- Feel free to interrupt or ask questions.
-- If the rep struggles badly → end with "I'm not interested."
-- If the rep does extremely well → end with "Okay let's do it."
-- Stay in character the entire time.
-`;
-
-try {
+const history = sessions[sessionId].history;
 history.push({ role: "user", content: message });
 
 const completion = await openai.chat.completions.create({
 model: "gpt-4o-mini",
 messages: [
-{ role: "system", content: SYSTEM_PROMPT },
+{ role: "system", content: INDUSTRY_PROMPT },
 ...history
 ]
 });
 
 const reply = completion.choices[0].message.content;
-
 history.push({ role: "assistant", content: reply });
 
-res.json({
-reply,
-persona
-});
-} catch (err) {
-console.error("API ERROR:", err);
-res.status(500).json({
-error: "Server error",
-details: err.message
-});
-}
+res.json({ reply });
 });
 
-/* -------------------------------
-EVALUATION / SCORING ENDPOINT
--------------------------------- */
+/* -------------------------
+EVALUATE + XP
+-------------------------- */
 app.post("/api/evaluate", async (req, res) => {
 const { sessionId } = req.body;
+const session = sessions[sessionId];
 
-if (!sessionId || !sessions[sessionId]) {
-return res.status(404).json({ error: "Session not found" });
+if (!session) return res.status(404).json({ error: "Session not found" });
+
+const evalPrompt = `
+Score the sales rep from 1–5 in each category:
+- Opener & Rapport
+- Discovery
+- Objection Handling
+- Confidence
+- Close
+
+Return STRICT JSON like:
+{
+"scores": {
+"opener": 3,
+"discovery": 2,
+"objections": 4,
+"confidence": 3,
+"close": 2
+},
+"summary": "short feedback"
 }
-
-const history = sessions[sessionId];
-
-const evaluationPrompt = `
-You are a professional sales coach.
-
-Evaluate the sales rep on a scale of 1–5 for each category:
-
-1. Opener & Rapport
-2. Discovery Questions
-3. Objection Handling
-4. Confidence & Tone
-5. Closing Attempt
-
-For EACH category:
-- Give a numeric score
-- Quote ONE example from the conversation
-- Give ONE specific improvement tip
-
-Finish with a short overall summary.
-Be concise and direct.
 `;
 
-try {
 const completion = await openai.chat.completions.create({
 model: "gpt-4o-mini",
 messages: [
-{ role: "system", content: evaluationPrompt },
-{ role: "user", content: JSON.stringify(history) }
+{ role: "system", content: evalPrompt },
+{ role: "user", content: JSON.stringify(session.history) }
 ]
 });
 
+const result = JSON.parse(completion.choices[0].message.content);
+const scores = result.scores;
+
+const baseXp =
+Object.values(scores).reduce((a, b) => a + b, 0) * 2;
+
+const xpEarned = Math.round(
+baseXp * DIFFICULTY_MULTIPLIER[session.difficulty]
+);
+
+const rep = reps[session.repId];
+rep.totalXp += xpEarned;
+rep.level = getLevel(rep.totalXp);
+rep.sessions += 1;
+
 res.json({
-evaluation: completion.choices[0].message.content
+scores,
+xpEarned,
+totalXp: rep.totalXp,
+level: rep.level,
+summary: result.summary
 });
-} catch (err) {
-console.error("EVAL ERROR:", err);
-res.status(500).json({
-error: "Evaluation failed",
-details: err.message
-});
-}
 });
 
-/* -------------------------------
-SERVER LISTENER
--------------------------------- */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-console.log(`Sales Trainer API running on port ${PORT}`);
+/* -------------------------
+LEADERBOARD
+-------------------------- */
+app.get("/api/leaderboard/:companyId", (req, res) => {
+const { companyId } = req.params;
+const repIds = companies[companyId] || [];
+
+const leaderboard = repIds
+.map((id) => reps[id])
+.sort((a, b) =>
+b.level !== a.level
+? b.level - a.level
+: b.totalXp - a.totalXp
+);
+
+res.json(leaderboard);
 });
+
+/* -------------------------
+SERVER
+-------------------------- */
+app.listen(3000, () =>
+console.log("Sales Trainer API running")
+);
