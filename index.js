@@ -37,6 +37,12 @@ for (const l of LEVELS) if (totalXp >= l.xp) cur = l.level;
 return cur;
 }
 
+function clamp(n, min, max) {
+const x = Number(n);
+if (!Number.isFinite(x)) return null;
+return Math.max(min, Math.min(max, x));
+}
+
 // -------- Industry prompts --------
 const INDUSTRY_CONFIG = {
 pest: `You are a homeowner approached by a door-to-door pest control sales rep.`,
@@ -137,16 +143,6 @@ if (session.user_id !== userId) {
 return res.status(403).json({ error: "Forbidden (wrong user)" });
 }
 
-// Load recent transcript (last 30 messages)
-const { data: msgs, error: mErr } = await supabaseAdmin
-.from("session_messages")
-.select("role, content")
-.eq("session_id", sessionId)
-.order("id", { ascending: true })
-.limit(30);
-
-if (mErr) throw mErr;
-
 const persona = session.persona || pickRandom(PERSONAS);
 const industryPrompt = INDUSTRY_CONFIG[session.industry] || INDUSTRY_CONFIG.pest;
 
@@ -170,20 +166,26 @@ Rules:
 - Stay in character.
 `.trim();
 
-// Save user message
+// Save user message FIRST
 await supabaseAdmin.from("session_messages").insert({
 session_id: sessionId,
 role: "user",
 content: message
 });
 
+// Load transcript AFTER inserting user message (last 30)
+const { data: msgs, error: mErr } = await supabaseAdmin
+.from("session_messages")
+.select("role, content")
+.eq("session_id", sessionId)
+.order("id", { ascending: true })
+.limit(30);
+
+if (mErr) throw mErr;
+
 const completion = await openai.chat.completions.create({
 model: "gpt-4o-mini",
-messages: [
-{ role: "system", content: SYSTEM_PROMPT },
-...(msgs || []),
-{ role: "user", content: message }
-]
+messages: [{ role: "system", content: SYSTEM_PROMPT }, ...(msgs || [])]
 });
 
 const reply = completion.choices?.[0]?.message?.content?.trim() || "";
@@ -231,34 +233,77 @@ const { data: msgs, error: mErr } = await supabaseAdmin
 
 if (mErr) throw mErr;
 
-// More reliable evaluator: strict JSON output
+const transcript = JSON.stringify(msgs || [], null, 0);
+
+// ===== SMART SCORECARD PROMPT =====
 const evalSystem = `
-You are a strict sales conversation evaluator.
-You MUST output ONLY valid JSON. No markdown. No extra text.
+You are an elite sales coach + evaluator.
+
+Return ONLY valid JSON. No markdown. No extra commentary.
+
+You are grading a sales rep roleplay conversation with a prospect.
+
+You MUST output:
+- stage reached (how far rep progressed)
+- where rep got stuck
+- delivery metrics: confidence, tone, pacing, clarity, energy
+- rubric breakdown by skill category
+- wins, coaching points, next best action
+- an overall score 0-100
+
+Scoring rules:
+- All score fields are numbers 0 to 100.
+- If unsure, estimate reasonably.
+- Be consistent: higher = better.
+
+Stages (choose best match):
+opener, rapport, discovery, value_prop, objection_handling, closing, follow_up
+
+Rubric keys (0-100):
+opener, discovery, value_proposition, objection_handling, closing, clarity, conciseness, curiosity_questions, active_listening, control_of_call
+
+Delivery keys (0-100):
+confidence, tone, pacing, clarity, energy
+
+Return JSON with EXACT keys:
+{
+"overall_score": number,
+"stage_reached": string,
+"wins": string[],
+"fixes": string[],
+"stuck_points": string[],
+"delivery": {
+"confidence": number,
+"tone": number,
+"pacing": number,
+"clarity": number,
+"energy": number,
+"wpm": number | null,
+"talk_ratio": number | null
+},
+"rubric": {
+"opener": number,
+"discovery": number,
+"value_proposition": number,
+"objection_handling": number,
+"closing": number,
+"clarity": number,
+"conciseness": number,
+"curiosity_questions": number,
+"active_listening": number,
+"control_of_call": number
+},
+"next_best_action": string,
+"headline": string
+}
 `.trim();
 
 const evalUser = `
-Context:
 Industry: ${session.industry}
 Persona: ${session.persona || "unknown"}
 
-Score the rep 1–5 (integers only):
-- opener
-- discovery
-- objections
-- confidence
-- close
-
-Return JSON in EXACT format:
-{
-"scores": { "opener": 3, "discovery": 2, "objections": 4, "confidence": 3, "close": 2 },
-"summary": "short, direct coaching recap (2-4 sentences)",
-"topFixes": ["...", "...", "..."],
-"betterClose": "one improved closing line"
-}
-
 Conversation transcript (array of messages):
-${JSON.stringify(msgs || [], null, 0)}
+${transcript}
 `.trim();
 
 const completion = await openai.chat.completions.create({
@@ -272,44 +317,104 @@ response_format: { type: "json_object" }
 
 const raw = completion.choices?.[0]?.message?.content || "{}";
 
-let parsed;
+let parsed = {};
 try {
-parsed = JSON.parse(raw);
-} catch {
-// fallback if model ever misbehaves
+parsed = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+} catch (e) {
 parsed = {
-scores: { opener: 3, discovery: 3, objections: 3, confidence: 3, close: 3 },
-summary: "Evaluator output failed to parse. Defaulted to neutral scores.",
-topFixes: ["Ask more discovery questions", "Quantify value", "Close with a clear next step"],
-betterClose: "If I can show you how this saves time, are you open to a quick 15-min follow up?"
+overall_score: 55,
+stage_reached: "discovery",
+wins: [],
+fixes: ["Evaluator output failed to parse. Re-run evaluation."],
+stuck_points: ["bad_json"],
+delivery: { confidence: 55, tone: 55, pacing: 55, clarity: 55, energy: 55, wpm: null, talk_ratio: null },
+rubric: {
+opener: 55,
+discovery: 55,
+value_proposition: 55,
+objection_handling: 55,
+closing: 55,
+clarity: 55,
+conciseness: 55,
+curiosity_questions: 55,
+active_listening: 55,
+control_of_call: 55
+},
+next_best_action: "Re-run evaluation after ending the session again.",
+headline: "Evaluation parse failed"
 };
 }
 
-const scores = parsed.scores || {};
-const safeScores = {
-opener: Number(scores.opener) || 1,
-discovery: Number(scores.discovery) || 1,
-objections: Number(scores.objections) || 1,
-confidence: Number(scores.confidence) || 1,
-close: Number(scores.close) || 1
+// normalize/safety
+parsed.wins = Array.isArray(parsed.wins) ? parsed.wins : [];
+parsed.fixes = Array.isArray(parsed.fixes) ? parsed.fixes : [];
+parsed.stuck_points = Array.isArray(parsed.stuck_points) ? parsed.stuck_points : [];
+
+parsed.delivery = parsed.delivery && typeof parsed.delivery === "object" ? parsed.delivery : {};
+parsed.rubric = parsed.rubric && typeof parsed.rubric === "object" ? parsed.rubric : {};
+
+// clamp key numeric fields 0..100
+const deliverySafe = {
+confidence: clamp(parsed.delivery.confidence, 0, 100) ?? 0,
+tone: clamp(parsed.delivery.tone, 0, 100) ?? 0,
+pacing: clamp(parsed.delivery.pacing, 0, 100) ?? 0,
+clarity: clamp(parsed.delivery.clarity, 0, 100) ?? 0,
+energy: clamp(parsed.delivery.energy, 0, 100) ?? 0,
+wpm: parsed.delivery.wpm == null ? null : clamp(parsed.delivery.wpm, 50, 260),
+talk_ratio: parsed.delivery.talk_ratio == null ? null : clamp(parsed.delivery.talk_ratio, 0, 1)
 };
 
-const baseXp = Object.values(safeScores).reduce((a, b) => a + b, 0) * 2;
+const rubricSafe = {
+opener: clamp(parsed.rubric.opener, 0, 100) ?? 0,
+discovery: clamp(parsed.rubric.discovery, 0, 100) ?? 0,
+value_proposition: clamp(parsed.rubric.value_proposition, 0, 100) ?? 0,
+objection_handling: clamp(parsed.rubric.objection_handling, 0, 100) ?? 0,
+closing: clamp(parsed.rubric.closing, 0, 100) ?? 0,
+clarity: clamp(parsed.rubric.clarity, 0, 100) ?? 0,
+conciseness: clamp(parsed.rubric.conciseness, 0, 100) ?? 0,
+curiosity_questions: clamp(parsed.rubric.curiosity_questions, 0, 100) ?? 0,
+active_listening: clamp(parsed.rubric.active_listening, 0, 100) ?? 0,
+control_of_call: clamp(parsed.rubric.control_of_call, 0, 100) ?? 0
+};
+
+const overallScore = clamp(parsed.overall_score, 0, 100);
+const overall = overallScore == null ? Math.round(Object.values(rubricSafe).reduce((a, b) => a + b, 0) / 10) : overallScore;
+
+// ===== XP calculation (based on overall + difficulty) =====
+const baseXp = Math.round((overall / 100) * 120); // 0..120
 const mult = DIFFICULTY_MULT[session.difficulty] ?? 1.1;
-const xpEarned = Math.round(baseXp * mult);
+const xpEarned = Math.max(5, Math.round(baseXp * mult)); // always earn something
 
 const newTotal = (profile.total_xp || 0) + xpEarned;
 const newLevel = getLevel(newTotal);
 
-// Write evaluation (unique per session)
+// Store evaluation (keep your existing "evaluations" table usage)
 const { error: eErr } = await supabaseAdmin.from("evaluations").insert({
 session_id: sessionId,
 company_id: profile.company_id,
 user_id: userId,
-scores: safeScores,
-summary: parsed.summary || "",
-xp_earned: xpEarned
+scores: rubricSafe, // keep this as your "scores" JSON column
+summary: parsed.headline || "", // keep this as summary text column
+xp_earned: xpEarned,
+// Optional: if your table has these columns, it will work; if not, Supabase will error.
+// If your evaluations table DOES NOT have these fields, remove them:
+delivery: deliverySafe,
+stage_reached: parsed.stage_reached || null,
+wins: parsed.wins,
+fixes: parsed.fixes,
+stuck_points: parsed.stuck_points,
+overall_score: overall
 });
+
+// If your evaluations table doesn't have the extra columns, comment the insert above and use this minimal insert:
+// const { error: eErr } = await supabaseAdmin.from("evaluations").insert({
+// session_id: sessionId,
+// company_id: profile.company_id,
+// user_id: userId,
+// scores: rubricSafe,
+// summary: parsed.headline || parsed.next_best_action || "",
+// xp_earned: xpEarned
+// });
 
 if (eErr) throw eErr;
 
@@ -327,11 +432,17 @@ const { error: pErr } = await supabaseAdmin
 
 if (pErr) throw pErr;
 
-res.json({
-scores: safeScores,
-summary: parsed.summary,
-topFixes: parsed.topFixes || [],
-betterClose: parsed.betterClose || "",
+// Return EXACT keys the UI can normalize
+return res.json({
+overall_score: overall,
+stage_reached: parsed.stage_reached || null,
+wins: parsed.wins,
+fixes: parsed.fixes,
+stuck_points: parsed.stuck_points,
+delivery: deliverySafe,
+rubric: rubricSafe,
+next_best_action: parsed.next_best_action || "",
+headline: parsed.headline || "",
 xpEarned,
 totalXp: newTotal,
 level: newLevel
