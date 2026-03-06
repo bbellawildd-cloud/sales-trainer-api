@@ -517,6 +517,58 @@ res.json({ leaderboard: data || [] });
 res.status(500).json({ error: "Leaderboard failed", details: e.message });
 }
 });
+app.post("/api/invite/send", async (req, res) => {
+try {
+const { managerUserId, repName, repEmail } = req.body;
 
+if (!managerUserId || !repEmail) {
+return res.status(400).json({ error: "Missing fields" });
+}
+
+// Get manager profile
+const { data: profile, error: pErr } = await supabaseAdmin
+.from("profiles")
+.select("company_id")
+.eq("user_id", managerUserId)
+.single();
+
+if (pErr || !profile) {
+return res.status(400).json({ error: "Manager profile not found" });
+}
+
+const code = crypto.randomUUID();
+
+// Insert invite
+const { error: iErr } = await supabaseAdmin
+.from("invites")
+.insert({
+company_id: profile.company_id,
+code,
+role: "rep",
+invited_email: repEmail,
+invited_by: managerUserId
+});
+
+if (iErr) throw iErr;
+
+const inviteLink = `${process.env.FRONTEND_URL}/invite/${code}`;
+
+await resend.emails.send({
+from: "AI Sales Trainer <onboarding@resend.dev>",
+to: repEmail,
+subject: "You're invited to AI Sales Trainer",
+html: `
+<h2>You were invited to AI Sales Trainer</h2>
+<p>${repName || "A rep"}, click below to join your company.</p>
+<a href="${inviteLink}">${inviteLink}</a>
+`
+});
+
+res.json({ success: true });
+
+} catch (err) {
+res.status(500).json({ error: err.message });
+}
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API running on ${PORT}`));
