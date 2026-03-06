@@ -3,12 +3,14 @@ import cors from "cors";
 import crypto from "crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
+import { Resend } from "resend";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const supabaseAdmin = createClient(
 process.env.SUPABASE_URL,
@@ -90,7 +92,6 @@ if (!userId) return res.status(400).json({ error: "Missing userId" });
 
 const profile = await getProfileOrThrow(userId);
 
-// Randomize ONCE per session
 const persona = pickRandom(PERSONAS);
 const faceSeed = crypto.randomUUID();
 
@@ -128,7 +129,6 @@ return res.status(400).json({ error: "Missing userId/sessionId/message" });
 
 const profile = await getProfileOrThrow(userId);
 
-// Fetch session and verify ownership/company
 const { data: session, error: sErr } = await supabaseAdmin
 .from("sessions")
 .select("id, company_id, user_id, industry, difficulty, persona, face_seed")
@@ -146,7 +146,6 @@ return res.status(403).json({ error: "Forbidden (wrong user)" });
 const persona = session.persona || pickRandom(PERSONAS);
 const industryPrompt = INDUSTRY_CONFIG[session.industry] || INDUSTRY_CONFIG.pest;
 
-// IMPORTANT: roleplay only. no grading. keep short.
 const SYSTEM_PROMPT = `
 You are acting as a REAL HUMAN for a sales training simulator.
 
@@ -166,14 +165,12 @@ Rules:
 - Stay in character.
 `.trim();
 
-// Save user message FIRST
 await supabaseAdmin.from("session_messages").insert({
 session_id: sessionId,
 role: "user",
 content: message
 });
 
-// Load transcript AFTER inserting user message (last 30)
 const { data: msgs, error: mErr } = await supabaseAdmin
 .from("session_messages")
 .select("role, content")
@@ -190,7 +187,6 @@ messages: [{ role: "system", content: SYSTEM_PROMPT }, ...(msgs || [])]
 
 const reply = completion.choices?.[0]?.message?.content?.trim() || "";
 
-// Save assistant reply
 await supabaseAdmin.from("session_messages").insert({
 session_id: sessionId,
 role: "assistant",
@@ -235,7 +231,6 @@ if (mErr) throw mErr;
 
 const transcript = JSON.stringify(msgs || [], null, 0);
 
-// ===== SMART SCORECARD PROMPT =====
 const evalSystem = `
 You are an elite sales coach + evaluator.
 
@@ -244,7 +239,7 @@ Return ONLY valid JSON. No markdown. No extra commentary.
 You are grading a sales rep roleplay conversation with a prospect.
 
 You MUST output:
-- stage reached (how far rep progressed)
+- stage reached
 - where rep got stuck
 - delivery metrics: confidence, tone, pacing, clarity, energy
 - rubric breakdown by skill category
@@ -256,13 +251,13 @@ Scoring rules:
 - If unsure, estimate reasonably.
 - Be consistent: higher = better.
 
-Stages (choose best match):
+Stages:
 opener, rapport, discovery, value_prop, objection_handling, closing, follow_up
 
-Rubric keys (0-100):
+Rubric keys:
 opener, discovery, value_proposition, objection_handling, closing, clarity, conciseness, curiosity_questions, active_listening, control_of_call
 
-Delivery keys (0-100):
+Delivery keys:
 confidence, tone, pacing, clarity, energy
 
 Return JSON with EXACT keys:
@@ -327,7 +322,15 @@ stage_reached: "discovery",
 wins: [],
 fixes: ["Evaluator output failed to parse. Re-run evaluation."],
 stuck_points: ["bad_json"],
-delivery: { confidence: 55, tone: 55, pacing: 55, clarity: 55, energy: 55, wpm: null, talk_ratio: null },
+delivery: {
+confidence: 55,
+tone: 55,
+pacing: 55,
+clarity: 55,
+energy: 55,
+wpm: null,
+talk_ratio: null
+},
 rubric: {
 opener: 55,
 discovery: 55,
@@ -345,15 +348,12 @@ headline: "Evaluation parse failed"
 };
 }
 
-// normalize/safety
 parsed.wins = Array.isArray(parsed.wins) ? parsed.wins : [];
 parsed.fixes = Array.isArray(parsed.fixes) ? parsed.fixes : [];
 parsed.stuck_points = Array.isArray(parsed.stuck_points) ? parsed.stuck_points : [];
-
 parsed.delivery = parsed.delivery && typeof parsed.delivery === "object" ? parsed.delivery : {};
 parsed.rubric = parsed.rubric && typeof parsed.rubric === "object" ? parsed.rubric : {};
 
-// clamp key numeric fields 0..100
 const deliverySafe = {
 confidence: clamp(parsed.delivery.confidence, 0, 100) ?? 0,
 tone: clamp(parsed.delivery.tone, 0, 100) ?? 0,
@@ -378,53 +378,46 @@ control_of_call: clamp(parsed.rubric.control_of_call, 0, 100) ?? 0
 };
 
 const overallScore = clamp(parsed.overall_score, 0, 100);
-const overall = overallScore == null ? Math.round(Object.values(rubricSafe).reduce((a, b) => a + b, 0) / 10) : overallScore;
+const overall =
+overallScore == null
+? Math.round(Object.values(rubricSafe).reduce((a, b) => a + b, 0) / 10)
+: overallScore;
 
-// ===== XP calculation (based on overall + difficulty) =====
-const baseXp = Math.round((overall / 100) * 120); // 0..120
+const baseXp = Math.round((overall / 100) * 120);
 const mult = DIFFICULTY_MULT[session.difficulty] ?? 1.1;
-const xpEarned = Math.max(5, Math.round(baseXp * mult)); // always earn something
+const xpEarned = Math.max(5, Math.round(baseXp * mult));
 
 const newTotal = (profile.total_xp || 0) + xpEarned;
 const newLevel = getLevel(newTotal);
 
-// Store evaluation (keep your existing "evaluations" table usage)
+// Minimal insert because your evaluations table only has:
+// id, session_id, company_id, user_id, scores, summary, xp_earned, created_at
 const { error: eErr } = await supabaseAdmin.from("evaluations").insert({
 session_id: sessionId,
 company_id: profile.company_id,
 user_id: userId,
-scores: rubricSafe, // keep this as your "scores" JSON column
-summary: parsed.headline || "", // keep this as summary text column
-xp_earned: xpEarned,
-// Optional: if your table has these columns, it will work; if not, Supabase will error.
-// If your evaluations table DOES NOT have these fields, remove them:
-delivery: deliverySafe,
+scores: {
+overall_score: overall,
 stage_reached: parsed.stage_reached || null,
 wins: parsed.wins,
 fixes: parsed.fixes,
 stuck_points: parsed.stuck_points,
-overall_score: overall
+delivery: deliverySafe,
+rubric: rubricSafe,
+next_best_action: parsed.next_best_action || "",
+headline: parsed.headline || ""
+},
+summary: parsed.headline || parsed.next_best_action || "",
+xp_earned: xpEarned
 });
-
-// If your evaluations table doesn't have the extra columns, comment the insert above and use this minimal insert:
-// const { error: eErr } = await supabaseAdmin.from("evaluations").insert({
-// session_id: sessionId,
-// company_id: profile.company_id,
-// user_id: userId,
-// scores: rubricSafe,
-// summary: parsed.headline || parsed.next_best_action || "",
-// xp_earned: xpEarned
-// });
 
 if (eErr) throw eErr;
 
-// End session
 await supabaseAdmin
 .from("sessions")
 .update({ ended_at: new Date().toISOString() })
 .eq("id", sessionId);
 
-// Update profile XP/level
 const { error: pErr } = await supabaseAdmin
 .from("profiles")
 .update({ total_xp: newTotal, level: newLevel })
@@ -432,7 +425,6 @@ const { error: pErr } = await supabaseAdmin
 
 if (pErr) throw pErr;
 
-// Return EXACT keys the UI can normalize
 return res.json({
 overall_score: overall,
 stage_reached: parsed.stage_reached || null,
@@ -449,6 +441,55 @@ level: newLevel
 });
 } catch (e) {
 res.status(500).json({ error: "Evaluate failed", details: e.message });
+}
+});
+
+// -------- Send rep invite email --------
+// Body: { managerUserId, repName, repEmail }
+app.post("/api/invite/send", async (req, res) => {
+try {
+const { managerUserId, repName, repEmail } = req.body;
+
+if (!managerUserId || !repEmail) {
+return res.status(400).json({ error: "Missing fields" });
+}
+
+const manager = await getProfileOrThrow(managerUserId);
+
+if (!manager.is_manager) {
+return res.status(403).json({ error: "Only managers can invite" });
+}
+
+const token = crypto.randomUUID();
+
+const { error: inviteErr } = await supabaseAdmin
+.from("invites")
+.insert({
+code: token,
+company_id: manager.company_id,
+created_by: managerUserId,
+rep_email: repEmail.toLowerCase().trim(),
+rep_name: (repName || "").trim()
+});
+
+if (inviteErr) throw inviteErr;
+
+const inviteLink = `${process.env.FRONTEND_URL}/invite/${token}`;
+
+await resend.emails.send({
+from: "Sales Trainer <onboarding@resend.dev>",
+to: repEmail.toLowerCase().trim(),
+subject: "You're invited to Sales Trainer",
+html: `
+<h2>You're invited!</h2>
+<p>${repName || "A rep"}, click below to join your team:</p>
+<p><a href="${inviteLink}">Accept Invite</a></p>
+`
+});
+
+res.json({ success: true, inviteLink });
+} catch (e) {
+res.status(500).json({ error: "Invite send failed", details: e.message });
 }
 });
 
