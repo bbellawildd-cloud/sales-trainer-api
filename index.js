@@ -147,83 +147,154 @@ res.status(500).json({ error: "Failed to start session", details: e.message });
 
 // -------- Chat (ROLEPLAY ONLY; NO SCORING) --------
 // Body: { userId, sessionId, message }
+// -------- Chat (ROLEPLAY WITH EMOTION) --------
 app.post("/api/chat", async (req, res) => {
 try {
+
 const { userId, sessionId, message } = req.body;
+
 if (!userId || !sessionId || !message) {
 return res.status(400).json({ error: "Missing userId/sessionId/message" });
 }
 
 const profile = await getProfileOrThrow(userId);
 
+// Get session
 const { data: session, error: sErr } = await supabaseAdmin
 .from("sessions")
-.select("id, company_id, user_id, industry, difficulty, persona, face_seed")
+.select("id, company_id, user_id, industry, difficulty, persona")
 .eq("id", sessionId)
 .single();
 
-if (sErr || !session) throw new Error(sErr?.message || "Session not found");
+if (sErr || !session) {
+throw new Error(sErr?.message || "Session not found");
+}
+
 if (session.company_id !== profile.company_id) {
-return res.status(403).json({ error: "Forbidden (wrong company)" });
+return res.status(403).json({ error: "Wrong company" });
 }
+
 if (session.user_id !== userId) {
-return res.status(403).json({ error: "Forbidden (wrong user)" });
+return res.status(403).json({ error: "Wrong user" });
 }
 
-let personaLabel = "prospect";
-let personaStyle = "You are a realistic prospect.";
-
-if (typeof session.persona === "string" && session.persona.includes(" || ")) {
-const parts = session.persona.split(" || ");
-personaLabel = parts[0] || "prospect";
-personaStyle = parts[1] || "You are a realistic prospect.";
-} else {
-personaLabel = session.persona || "prospect";
-}
-const industryPrompt = INDUSTRY_CONFIG[session.industry] || INDUSTRY_CONFIG.pest;
+const persona = session.persona || pickRandom(PERSONAS);
+const industryPrompt =
+INDUSTRY_CONFIG[session.industry] || INDUSTRY_CONFIG.pest;
 
 const SYSTEM_PROMPT = `
-You are acting as a REAL HUMAN for a sales training simulator.
+You are a REAL HUMAN prospect in a sales training simulator.
 
 Industry:
 ${industryPrompt}
 
-Prospect type:
-${personaLabel}
+Persona:
+${persona}
 
-Personality rules:
-${personaStyle}
+Rules:
+- Respond like a real person.
+- Keep responses SHORT (1–2 sentences).
+- Stay in character.
+- Never coach the rep.
+- Never explain you are an AI.
 
-Difficulty:
-${session.difficulty || 1} out of 5
+Return ONLY valid JSON:
 
-Core behavior rules:
-- Respond like a REAL PERSON, never like an AI.
-- Keep responses natural and conversational
-- Usually respond in 1-3 sentences.
-- Do not coach the rep.
-- Do not break character.
-- Do not sound scripted.
-- If the rep is weak, be harder to convince.
-- If the rep is strong, become more open naturally.
-- Ask realistic questions and objections when appropriate.
-- If difficulty is higher, be tougher, more skeptical, and require more clarity.
-- If difficulty is lower, be more forgiving and easier to engage.
-- If the rep rambles, lose patience.
-- If the rep is vague, challenge them.
-- If the rep is strong, reward them with warmer responses.
-- Only agree at the end if the rep actually earns it.
+{
+"reply": "your response here",
+"emotion": "idle"
+}
 
-Conversation outcome rules:
-- If the rep struggles badly, end with: "I'm not interested."
-- If the rep clearly earns the next step, end with: "Okay, let's do it."
+Allowed emotions:
+idle
+skeptical
+annoyed
+happy
+confused
+thinking
+not_interested
+surprised
 `.trim();
 
+
+// Save user message
 await supabaseAdmin.from("session_messages").insert({
 session_id: sessionId,
 role: "user",
 content: message
 });
+
+// Load conversation history
+const { data: msgs } = await supabaseAdmin
+.from("session_messages")
+.select("role, content")
+.eq("session_id", sessionId)
+.order("id", { ascending: true })
+.limit(30);
+
+const completion = await openai.chat.completions.create({
+model: "gpt-4o-mini",
+messages: [
+{ role: "system", content: SYSTEM_PROMPT },
+...(msgs || [])
+],
+response_format: { type: "json_object" }
+});
+
+const raw = completion.choices?.[0]?.message?.content || "{}";
+
+let parsed;
+
+try {
+parsed = JSON.parse(raw);
+} catch {
+parsed = {
+reply: raw,
+emotion: "idle"
+};
+}
+
+const allowedEmotions = [
+"idle",
+"skeptical",
+"annoyed",
+"happy",
+"confused",
+"thinking",
+"not_interested",
+"surprised"
+];
+
+const reply = parsed.reply || "...";
+
+const emotion = allowedEmotions.includes(parsed.emotion)
+? parsed.emotion
+: "idle";
+
+// Save AI reply
+await supabaseAdmin.from("session_messages").insert({
+session_id: sessionId,
+role: "assistant",
+content: reply
+});
+
+res.json({
+reply,
+emotion
+});
+
+} catch (err) {
+
+console.error("CHAT ERROR", err);
+
+res.status(500).json({
+error: "Chat failed",
+details: err.message
+});
+
+}
+});
+
 
 const { data: msgs, error: mErr } = await supabaseAdmin
 .from("session_messages")
