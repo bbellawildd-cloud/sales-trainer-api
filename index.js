@@ -6,10 +6,14 @@ import { createClient } from "@supabase/supabase-js";
 import { Resend } from "resend";
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+apiKey: process.env.OPENAI_API_KEY
+});
+
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const supabaseAdmin = createClient(
@@ -17,7 +21,9 @@ process.env.SUPABASE_URL,
 process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// -------- XP/Level config --------
+/* =========================
+XP / Level config
+========================= */
 const LEVELS = [
 { level: 1, xp: 0 },
 { level: 2, xp: 50 },
@@ -31,11 +37,19 @@ const LEVELS = [
 { level: 10, xp: 2350 }
 ];
 
-const DIFFICULTY_MULT = { 1: 1.0, 2: 1.1, 3: 1.25, 4: 1.4, 5: 1.6 };
+const DIFFICULTY_MULT = {
+1: 1.0,
+2: 1.1,
+3: 1.25,
+4: 1.4,
+5: 1.6
+};
 
 function getLevel(totalXp) {
 let cur = 1;
-for (const l of LEVELS) if (totalXp >= l.xp) cur = l.level;
+for (const l of LEVELS) {
+if (totalXp >= l.xp) cur = l.level;
+}
 return cur;
 }
 
@@ -45,46 +59,58 @@ if (!Number.isFinite(x)) return null;
 return Math.max(min, Math.min(max, x));
 }
 
-// -------- Industry prompts --------
+/* =========================
+Industry prompts
+========================= */
 const INDUSTRY_CONFIG = {
-pest: `You are a homeowner approached by a door-to-door pest control sales rep.`,
-solar: `You are a homeowner approached by a solar sales rep.`,
-insurance: `You are a consumer on a call with an insurance rep.`
+pest: "You are a homeowner approached by a door-to-door pest control sales rep.",
+solar: "You are a homeowner approached by a solar sales rep.",
+insurance: "You are a consumer on a call with an insurance rep."
 };
 
-// Random persona pool (session-level randomization)
+/* =========================
+Persona pool
+========================= */
 const PERSONAS = [
 {
 label: "hostile homeowner",
-style: "You are annoyed, defensive, and do not trust salespeople. Be short, skeptical, and hard to win over."
+style:
+"You are annoyed, defensive, and do not trust salespeople. Be short, skeptical, and hard to win over."
 },
 {
 label: "skeptical engineer",
-style: "You are analytical, detail-oriented, and highly skeptical. You challenge vague claims and ask sharp follow-up questions."
+style:
+"You are analytical, detail-oriented, and highly skeptical. You challenge vague claims and ask sharp follow-up questions."
 },
 {
 label: "busy parent",
-style: "You are distracted, rushed, and low on patience. You will only stay engaged if the rep is concise and relevant."
+style:
+"You are distracted, rushed, and low on patience. You will only stay engaged if the rep is concise and relevant."
 },
 {
 label: "friendly but distracted prospect",
-style: "You are nice and conversational, but your attention drifts. The rep must control the conversation to keep momentum."
+style:
+"You are nice and conversational, but your attention drifts. The rep must control the conversation to keep momentum."
 },
 {
 label: "confused older prospect",
-style: "You are polite but confused by jargon. The rep must simplify clearly or you lose track fast."
+style:
+"You are polite but confused by jargon. The rep must simplify clearly or you lose track fast."
 },
 {
 label: "curious buyer",
-style: "You are open-minded and interested, but still need confidence, clarity, and a reason to act now."
+style:
+"You are open-minded and interested, but still need confidence, clarity, and a reason to act now."
 },
 {
 label: "price-sensitive skeptic",
-style: "You care heavily about cost and assume the offer is too expensive. You press hard on value and price."
+style:
+"You care heavily about cost and assume the offer is too expensive. You press hard on value and price."
 },
 {
 label: "emotionally guarded prospect",
-style: "You do not open up easily. The rep must build rapport and ask good discovery questions to get real answers."
+style:
+"You do not open up easily. The rep must build rapport and ask good discovery questions to get real answers."
 }
 ];
 
@@ -92,7 +118,9 @@ function pickRandom(arr) {
 return arr[Math.floor(Math.random() * arr.length)];
 }
 
-// -------- Helper: verify user + get profile (company) --------
+/* =========================
+Helpers
+========================= */
 async function getProfileOrThrow(userId) {
 const { data, error } = await supabaseAdmin
 .from("profiles")
@@ -101,29 +129,92 @@ const { data, error } = await supabaseAdmin
 .single();
 
 if (error || !data) {
-const msg = error?.message || "Profile not found";
-throw new Error(msg);
+throw new Error(error?.message || "Profile not found");
 }
+
 return data;
 }
 
-app.get("/", (req, res) => res.json({ ok: true }));
+function extractScriptPoints(scriptText) {
+return String(scriptText || "")
+.split("\n")
+.map((line) => line.trim())
+.filter(Boolean)
+.map((line) => line.replace(/^[-*•\d.)\s]+/, "").trim())
+.filter((line) => line.length >= 8)
+.slice(0, 10);
+}
 
-// -------- Start session --------
-// Body: { userId, industry, difficulty }
+function detectConversationOutcome(text) {
+const t = String(text || "").toLowerCase();
+
+const wonPhrases = [
+"let's do it",
+"okay let's do it",
+"okay, let's do it",
+"send me the agreement",
+"send me the contract",
+"let's move forward",
+"i'm in",
+"i will buy",
+"i'll buy",
+"we'll do it",
+"book me",
+"let's get started",
+"sign me up"
+];
+
+const lostPhrases = [
+"i'm not interested",
+"not interested",
+"we're not interested",
+"we will pass",
+"we'll pass",
+"no thanks",
+"no thank you",
+"not a fit",
+"not moving forward",
+"stop calling",
+"take me off",
+"don't call again"
+];
+
+if (wonPhrases.some((phrase) => t.includes(phrase))) return "won";
+if (lostPhrases.some((phrase) => t.includes(phrase))) return "lost";
+return null;
+}
+
+app.get("/", (req, res) => {
+res.json({ ok: true });
+});
+
+/* =========================
+Start session
+Body: { userId, industry, difficulty, scriptText, scriptPoints }
+========================= */
 app.post("/api/session/start", async (req, res) => {
 try {
-const { userId, industry = "pest", difficulty = 2 } = req.body;
-if (!userId) return res.status(400).json({ error: "Missing userId" });
+const {
+userId,
+industry = "pest",
+difficulty = 2,
+scriptText = "",
+scriptPoints = []
+} = req.body || {};
+
+if (!userId) {
+return res.status(400).json({ error: "Missing userId" });
+}
 
 const profile = await getProfileOrThrow(userId);
-
 const persona = pickRandom(PERSONAS);
 const faceSeed = crypto.randomUUID();
 
-const { data: session, error } = await supabaseAdmin
-.from("sessions")
-.insert({
+const safeScriptPoints = Array.isArray(scriptPoints)
+? scriptPoints.filter(Boolean).slice(0, 10)
+: extractScriptPoints(scriptText);
+
+const insertPayload = {
 user_id: userId,
 company_id: profile.company_id,
 industry,
@@ -131,7 +222,14 @@ difficulty,
 persona: persona.label,
 persona_style: persona.style,
 face_seed: faceSeed
-})
+};
+
+if (scriptText) insertPayload.script_text = scriptText;
+if (safeScriptPoints.length) insertPayload.script_points = safeScriptPoints;
+
+const { data: session, error } = await supabaseAdmin
+.from("sessions")
+.insert(insertPayload)
 .select("id, industry, difficulty, persona, face_seed, created_at")
 .single();
 
@@ -141,28 +239,41 @@ const faceUrl = `https://api.dicebear.com/8.x/notionists/png?seed=${faceSeed}`;
 
 res.json({ session, faceUrl });
 } catch (e) {
-res.status(500).json({ error: "Failed to start session", details: e.message });
+console.error("START SESSION ERROR", e);
+res.status(500).json({
+error: "Failed to start session",
+details: e.message
+});
 }
 });
 
-// -------- Chat (ROLEPLAY ONLY; NO SCORING) --------
-// Body: { userId, sessionId, message }
-// -------- Chat (ROLEPLAY WITH EMOTION) --------
+/* =========================
+Chat
+Body: { userId, sessionId, message, scriptText, scriptPoints }
+========================= */
 app.post("/api/chat", async (req, res) => {
 try {
-
-const { userId, sessionId, message } = req.body;
+const {
+userId,
+sessionId,
+message,
+scriptText = "",
+scriptPoints = []
+} = req.body || {};
 
 if (!userId || !sessionId || !message) {
-return res.status(400).json({ error: "Missing userId/sessionId/message" });
+return res.status(400).json({
+error: "Missing userId/sessionId/message"
+});
 }
 
 const profile = await getProfileOrThrow(userId);
 
-// Get session
 const { data: session, error: sErr } = await supabaseAdmin
 .from("sessions")
-.select("id, company_id, user_id, industry, difficulty, persona")
+.select(
+"id, company_id, user_id, industry, difficulty, persona, persona_style, script_text, script_points"
+)
 .eq("id", sessionId)
 .single();
 
@@ -178,9 +289,17 @@ if (session.user_id !== userId) {
 return res.status(403).json({ error: "Wrong user" });
 }
 
-const persona = session.persona || pickRandom(PERSONAS);
 const industryPrompt =
 INDUSTRY_CONFIG[session.industry] || INDUSTRY_CONFIG.pest;
+
+const effectiveScriptText = scriptText || session.script_text || "";
+const effectiveScriptPoints =
+(Array.isArray(scriptPoints) && scriptPoints.length
+? scriptPoints
+: Array.isArray(session.script_points)
+? session.script_points
+: extractScriptPoints(effectiveScriptText)
+).slice(0, 10);
 
 const SYSTEM_PROMPT = `
 You are a REAL HUMAN prospect in a sales training simulator.
@@ -188,21 +307,33 @@ You are a REAL HUMAN prospect in a sales training simulator.
 Industry:
 ${industryPrompt}
 
-Persona:
-${persona}
+Persona label:
+${session.persona || "prospect"}
+
+Persona style:
+${session.persona_style || "Act like a realistic buyer."}
+
+Optional rep script context:
+${effectiveScriptText ? effectiveScriptText : "No script provided."}
+
+Key script points:
+${effectiveScriptPoints.length ? effectiveScriptPoints.map((p, i) => `${i + 1}. ${p}`).join("\n") : "No key points provided."}
 
 Rules:
 - Respond like a real person.
-- Keep responses SHORT (1–2 sentences).
+- Keep responses SHORT, usually 1 to 2 sentences.
 - Stay in character.
-- Never coach the rep.
-- Never explain you are an AI.
+- Never coach the rep directly.
+- Never explain that you are AI.
+- If the rep earns the deal, you can agree to move forward.
+- If the rep loses you, you can clearly reject the offer.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON in this exact shape:
 
 {
 "reply": "your response here",
-"emotion": "idle"
+"emotion": "idle",
+"conversationOutcome": null
 }
 
 Allowed emotions:
@@ -214,23 +345,27 @@ confused
 thinking
 not_interested
 surprised
+
+Allowed conversationOutcome values:
+null
+"won"
+"lost"
 `.trim();
 
-
-// Save user message
 await supabaseAdmin.from("session_messages").insert({
 session_id: sessionId,
 role: "user",
 content: message
 });
 
-// Load conversation history
-const { data: msgs } = await supabaseAdmin
+const { data: msgs, error: mErr } = await supabaseAdmin
 .from("session_messages")
 .select("role, content")
 .eq("session_id", sessionId)
 .order("id", { ascending: true })
 .limit(30);
+
+if (mErr) throw mErr;
 
 const completion = await openai.chat.completions.create({
 model: "gpt-4o-mini",
@@ -244,13 +379,13 @@ response_format: { type: "json_object" }
 const raw = completion.choices?.[0]?.message?.content || "{}";
 
 let parsed;
-
 try {
 parsed = JSON.parse(raw);
 } catch {
 parsed = {
 reply: raw,
-emotion: "idle"
+emotion: "idle",
+conversationOutcome: detectConversationOutcome(raw)
 };
 }
 
@@ -265,13 +400,16 @@ const allowedEmotions = [
 "surprised"
 ];
 
-const reply = parsed.reply || "...";
-
+const reply = String(parsed.reply || "...").trim();
 const emotion = allowedEmotions.includes(parsed.emotion)
 ? parsed.emotion
 : "idle";
 
-// Save AI reply
+let conversationOutcome = parsed.conversationOutcome;
+if (conversationOutcome !== "won" && conversationOutcome !== "lost") {
+conversationOutcome = detectConversationOutcome(reply);
+}
+
 await supabaseAdmin.from("session_messages").insert({
 session_id: sessionId,
 role: "assistant",
@@ -280,55 +418,33 @@ content: reply
 
 res.json({
 reply,
-emotion
+emotion,
+conversationOutcome: conversationOutcome || null
 });
-
 } catch (err) {
-
 console.error("CHAT ERROR", err);
-
 res.status(500).json({
 error: "Chat failed",
 details: err.message
 });
-
 }
 });
 
-
-const { data: msgs, error: mErr } = await supabaseAdmin
-.from("session_messages")
-.select("role, content")
-.eq("session_id", sessionId)
-.order("id", { ascending: true })
-.limit(30);
-
-if (mErr) throw mErr;
-
-const completion = await openai.chat.completions.create({
-model: "gpt-4o-mini",
-messages: [{ role: "system", content: SYSTEM_PROMPT }, ...(msgs || [])]
-});
-
-const reply = completion.choices?.[0]?.message?.content?.trim() || "";
-
-await supabaseAdmin.from("session_messages").insert({
-session_id: sessionId,
-role: "assistant",
-content: reply
-});
-
-res.json({ reply });
-} catch (e) {
-res.status(500).json({ error: "Chat failed", details: e.message });
-}
-});
-
-// -------- Evaluate + XP (ONLY AT END) --------
-// Body: { userId, sessionId }
+/* =========================
+Evaluate + XP
+Body: { userId, sessionId, scriptText, scriptPoints, outcome, autoEnded }
+========================= */
 app.post("/api/evaluate", async (req, res) => {
 try {
-const { userId, sessionId } = req.body;
+const {
+userId,
+sessionId,
+scriptText = "",
+scriptPoints = [],
+outcome = null,
+autoEnded = false
+} = req.body || {};
+
 if (!userId || !sessionId) {
 return res.status(400).json({ error: "Missing userId/sessionId" });
 }
@@ -337,11 +453,16 @@ const profile = await getProfileOrThrow(userId);
 
 const { data: session, error: sErr } = await supabaseAdmin
 .from("sessions")
-.select("id, company_id, user_id, industry, difficulty, persona")
+.select(
+"id, company_id, user_id, industry, difficulty, persona, script_text, script_points"
+)
 .eq("id", sessionId)
 .single();
 
-if (sErr || !session) throw new Error(sErr?.message || "Session not found");
+if (sErr || !session) {
+throw new Error(sErr?.message || "Session not found");
+}
+
 if (session.company_id !== profile.company_id || session.user_id !== userId) {
 return res.status(403).json({ error: "Forbidden" });
 }
@@ -356,8 +477,17 @@ if (mErr) throw mErr;
 
 const transcript = JSON.stringify(msgs || [], null, 0);
 
+const effectiveScriptText = scriptText || session.script_text || "";
+const effectiveScriptPoints =
+(Array.isArray(scriptPoints) && scriptPoints.length
+? scriptPoints
+: Array.isArray(session.script_points)
+? session.script_points
+: extractScriptPoints(effectiveScriptText)
+).slice(0, 10);
+
 const evalSystem = `
-You are an elite sales coach + evaluator.
+You are an elite sales coach and evaluator.
 
 Return ONLY valid JSON. No markdown. No extra commentary.
 
@@ -414,13 +544,23 @@ Return JSON with EXACT keys:
 "control_of_call": number
 },
 "next_best_action": string,
-"headline": string
+"headline": string,
+"script_points_hit": string[],
+"script_points_missed": string[]
 }
 `.trim();
 
 const evalUser = `
 Industry: ${session.industry}
 Persona: ${session.persona || "unknown"}
+Conversation outcome: ${outcome || "unknown"}
+Auto ended: ${autoEnded ? "yes" : "no"}
+
+Optional script:
+${effectiveScriptText || "No script provided."}
+
+Key script points:
+${effectiveScriptPoints.length ? effectiveScriptPoints.join("\n") : "No script points provided."}
 
 Conversation transcript (array of messages):
 ${transcript}
@@ -469,13 +609,17 @@ active_listening: 55,
 control_of_call: 55
 },
 next_best_action: "Re-run evaluation after ending the session again.",
-headline: "Evaluation parse failed"
+headline: "Evaluation parse failed",
+script_points_hit: [],
+script_points_missed: effectiveScriptPoints
 };
 }
 
 parsed.wins = Array.isArray(parsed.wins) ? parsed.wins : [];
 parsed.fixes = Array.isArray(parsed.fixes) ? parsed.fixes : [];
 parsed.stuck_points = Array.isArray(parsed.stuck_points) ? parsed.stuck_points : [];
+parsed.script_points_hit = Array.isArray(parsed.script_points_hit) ? parsed.script_points_hit : [];
+parsed.script_points_missed = Array.isArray(parsed.script_points_missed) ? parsed.script_points_missed : [];
 parsed.delivery = parsed.delivery && typeof parsed.delivery === "object" ? parsed.delivery : {};
 parsed.rubric = parsed.rubric && typeof parsed.rubric === "object" ? parsed.rubric : {};
 
@@ -515,13 +659,7 @@ const xpEarned = Math.max(5, Math.round(baseXp * mult));
 const newTotal = (profile.total_xp || 0) + xpEarned;
 const newLevel = getLevel(newTotal);
 
-// Minimal insert because your evaluations table only has:
-// id, session_id, company_id, user_id, scores, summary, xp_earned, created_at
-const { error: eErr } = await supabaseAdmin.from("evaluations").insert({
-session_id: sessionId,
-company_id: profile.company_id,
-user_id: userId,
-scores: {
+const scoresPayload = {
 overall_score: overall,
 stage_reached: parsed.stage_reached || null,
 wins: parsed.wins,
@@ -530,8 +668,18 @@ stuck_points: parsed.stuck_points,
 delivery: deliverySafe,
 rubric: rubricSafe,
 next_best_action: parsed.next_best_action || "",
-headline: parsed.headline || ""
-},
+headline: parsed.headline || "",
+script_points_hit: parsed.script_points_hit,
+script_points_missed: parsed.script_points_missed,
+conversation_outcome: outcome || null,
+auto_ended: Boolean(autoEnded)
+};
+
+const { error: eErr } = await supabaseAdmin.from("evaluations").insert({
+session_id: sessionId,
+company_id: profile.company_id,
+user_id: userId,
+scores: scoresPayload,
 summary: parsed.headline || parsed.next_best_action || "",
 xp_earned: xpEarned
 });
@@ -560,20 +708,28 @@ delivery: deliverySafe,
 rubric: rubricSafe,
 next_best_action: parsed.next_best_action || "",
 headline: parsed.headline || "",
+script_points_hit: parsed.script_points_hit,
+script_points_missed: parsed.script_points_missed,
 xpEarned,
 totalXp: newTotal,
 level: newLevel
 });
 } catch (e) {
-res.status(500).json({ error: "Evaluate failed", details: e.message });
+console.error("EVALUATE ERROR", e);
+res.status(500).json({
+error: "Evaluate failed",
+details: e.message
+});
 }
 });
 
-// -------- Send rep invite email --------
-// Body: { managerUserId, repName, repEmail }
+/* =========================
+Send rep invite email
+Body: { managerUserId, repName, repEmail }
+========================= */
 app.post("/api/invite/send", async (req, res) => {
 try {
-const { managerUserId, repName, repEmail } = req.body;
+const { managerUserId, repName, repEmail } = req.body || {};
 
 if (!managerUserId || !repEmail) {
 return res.status(400).json({ error: "Missing fields" });
@@ -614,16 +770,25 @@ html: `
 
 res.json({ success: true, inviteLink });
 } catch (e) {
-res.status(500).json({ error: "Invite send failed", details: e.message });
+console.error("INVITE ERROR", e);
+res.status(500).json({
+error: "Invite send failed",
+details: e.message
+});
 }
 });
 
-// -------- Leaderboard (same company) --------
-// Query: /api/leaderboard?userId=...
+/* =========================
+Leaderboard
+Query: /api/leaderboard?userId=...
+========================= */
 app.get("/api/leaderboard", async (req, res) => {
 try {
 const { userId } = req.query;
-if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+if (!userId) {
+return res.status(400).json({ error: "Missing userId" });
+}
 
 const profile = await getProfileOrThrow(userId);
 
@@ -639,61 +804,15 @@ if (error) throw error;
 
 res.json({ leaderboard: data || [] });
 } catch (e) {
-res.status(500).json({ error: "Leaderboard failed", details: e.message });
+console.error("LEADERBOARD ERROR", e);
+res.status(500).json({
+error: "Leaderboard failed",
+details: e.message
+});
 }
 });
-app.post("/api/invite/send", async (req, res) => {
-try {
-const { managerUserId, repName, repEmail } = req.body;
 
-if (!managerUserId || !repEmail) {
-return res.status(400).json({ error: "Missing fields" });
-}
-
-// Get manager profile
-const { data: profile, error: pErr } = await supabaseAdmin
-.from("profiles")
-.select("company_id")
-.eq("user_id", managerUserId)
-.single();
-
-if (pErr || !profile) {
-return res.status(400).json({ error: "Manager profile not found" });
-}
-
-const code = crypto.randomUUID();
-
-// Insert invite
-const { error: iErr } = await supabaseAdmin
-.from("invites")
-.insert({
-company_id: profile.company_id,
-code,
-role: "rep",
-invited_email: repEmail,
-invited_by: managerUserId
-});
-
-if (iErr) throw iErr;
-
-const inviteLink = `${process.env.FRONTEND_URL}/invite/${code}`;
-
-await resend.emails.send({
-from: "AI Sales Trainer <onboarding@resend.dev>",
-to: repEmail,
-subject: "You're invited to AI Sales Trainer",
-html: `
-<h2>You were invited to AI Sales Trainer</h2>
-<p>${repName || "A rep"}, click below to join your company.</p>
-<a href="${inviteLink}">${inviteLink}</a>
-`
-});
-
-res.json({ success: true });
-
-} catch (err) {
-res.status(500).json({ error: err.message });
-}
-});
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on ${PORT}`));
+app.listen(PORT, () => {
+console.log(`API running on ${PORT}`);
+});
